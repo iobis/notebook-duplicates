@@ -14,10 +14,6 @@ This notebook tries to identify duplicate datasets in the OBIS system. This is d
 
 ![grids](images/grids.png)
 
-## How to use this notebook
-
-Delete the `vectors` directory to calculate vectors based on the latest data.
-
 ## Dependencies
 
 ```{r message=FALSE, warning=FALSE}
@@ -117,7 +113,7 @@ suspect <- similarity %>%
   filter(similarity > 0.85) %>%
   left_join(datasets, by = c("x" = "id")) %>%
   left_join(datasets, by = c("y" = "id"), suffix = c("_x", "_y")) %>%
-  arrange(desc(similarity)) %>%
+  arrange(desc(similarity), desc(records_x + records_y)) %>%
   as_tibble()
 
 suspect 
