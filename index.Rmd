@@ -10,7 +10,7 @@ knit: (function(inputFile, encoding) {
   rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
 ---
 
-This notebook tries to identify duplicate datasets in the OBIS system. This is done by aggregating datasets by geohash, species, and year, and calculating [cosine similarities](https://en.wikipedia.org/wiki/Cosine_similarity) between datasets. Skip to results [here](#results).
+This notebook tries to identify duplicate datasets in the OBIS system. This is done by aggregating datasets by geohash, species, and year, and calculating ~~[cosine similarities](https://en.wikipedia.org/wiki/Cosine_similarity)~~ Jaccard similarities between datasets. Skip to results [here](#results).
 
 ![grids](images/grids.png)
 
@@ -23,82 +23,70 @@ library(Matrix)
 library(dplyr)
 library(arrow)
 library(dplyr)
-library(geohashTools)
 library(data.table)
+library(duckdb)
+library(DBI)
 library(reactable)
 ```
 
-## Fetch occurrences from S3
+## Calculate similarities
 
-This fetches just the necessary columns from the OBIS export on S3.
-
-```{r message=FALSE, warning=FALSE, eval=FALSE}
-space <- S3FileSystem$create(
-  anonymous = TRUE,
-  scheme = "https",
-  endpoint_override = "ams3.digitaloceanspaces.com"
-)
-
-occ <- open_dataset(space$path("obis-datasets/exports/obis_20220208.parquet")) %>%
-  select(dataset_id, decimalLongitude, decimalLatitude, AphiaID, year = date_year) %>%
-  as_tibble()
-```
-
-## Aggregate datasets by geohash, species, and year
+Aggregate datasets by geohash, species, and year. Then calculate Jaccard similarity.
 
 ```{r message=FALSE, warning=FALSE, eval=FALSE}
-stats <- occ %>%
-  filter(!is.na(year) & decimalLatitude < 90 & decimalLongitude < 180) %>%
-  mutate(geohash = gh_encode(decimalLatitude, decimalLongitude, 2)) %>%
-  mutate(cell = factor(paste(geohash, AphiaID, year, sep = "_"))) %>%
-  group_by(dataset_id, cell) %>%
-  summarize(records = n())
-```
+con <- dbConnect(duckdb())
 
-## Generate vectors and calculate similarity
+similarity <- dbGetQuery(con, glue("
+  install h3 from community;
+  load h3;
 
-First generate vectors by dataset and store as `sparseVector`.
+  WITH cells_per_dataset AS (
+    SELECT DISTINCT
+      dataset_id,
+      concat_ws(
+        '_',
+        interpreted.AphiaID,
+        interpreted.date_year,
+        h3_latlng_to_cell_string(interpreted.decimalLatitude, interpreted.decimalLongitude, 2)
+      ) as cell
+    FROM read_parquet('/Volumes/acasis/occurrence/*')
+  ),
 
-```{r message=FALSE, warning=FALSE, eval=FALSE}
-n_cells <- length(levels(stats$cell))
-dataset_ids <- unique(stats$dataset_id)
+  dataset_cell_counts AS (
+    SELECT
+      dataset_id,
+      COUNT(*) as total_cells
+    FROM cells_per_dataset
+    GROUP BY dataset_id
+  ),
 
-vectors <- list()
+  intersections AS (
+    SELECT
+      a.dataset_id as x,
+      b.dataset_id as y,
+      COUNT(*) as intersection_size
+    FROM cells_per_dataset a
+    JOIN cells_per_dataset b ON a.cell = b.cell
+    WHERE a.dataset_id < b.dataset_id
+    GROUP BY a.dataset_id, b.dataset_id
+  )
 
-for (id in dataset_ids) {
-  message(id)
-  vector <- rep(0, n_cells)
-  dataset <- stats %>%
-    filter(dataset_id == id)
-  for (i in 1:nrow(dataset)) {
-    vector[as.numeric(dataset$cell[i])] <- dataset$records[i]
-  }
-  vectors[[id]] <- as(vector, "sparseVector")
-}
-```
-
-Calculate similarities using parallelization and write the results to a text file.
-
-```{r message=FALSE, warning=FALSE, eval=FALSE}
-write("x y similarity", file = "similarity.txt", append = FALSE)
-
-parallel::mclapply(1:length(dataset_ids), function(i) {
-  dataset_x <- dataset_ids[i]
-  x <- as.vector(vectors[[dataset_x]])
-  for (j in (i + 1):length(dataset_ids)) {
-    dataset_y <- dataset_ids[j]
-    y <- as.vector(vectors[[dataset_y]])
-    similarity <- coop::cosine(x, y)
-    line <- paste(dataset_x, dataset_y, format(similarity, scientific = FALSE))
-    write(line, file = "similarity.txt", append = TRUE)
-  }
-}, mc.cores = 6)
+  SELECT
+    i.x,
+    i.y,
+    i.intersection_size,
+    a.total_cells + b.total_cells - i.intersection_size as union_size,
+    i.intersection_size::FLOAT / (a.total_cells + b.total_cells - i.intersection_size) as similarity,
+    1 - (i.intersection_size::FLOAT / (a.total_cells + b.total_cells - i.intersection_size)) as distance
+  FROM intersections i
+  JOIN dataset_cell_counts a ON i.x = a.dataset_id
+  JOIN dataset_cell_counts b ON i.y = b.dataset_id;
+"))
 ```
 
 Plot the similarities to get an idea of the distribution.
 
 ```{r message=FALSE, warning=FALSE}
-similarity <- fread("similarity.txt", sep = " ", header = TRUE)
 plot(similarity$similarity)
 ```
 
@@ -110,7 +98,7 @@ datasets <- robis::dataset() %>%
   select(id, url, title, records = Occurrence)
 
 suspect <- similarity %>%
-  filter(similarity > 0.85) %>%
+  filter(similarity > 0.5) %>%
   left_join(datasets, by = c("x" = "id")) %>%
   left_join(datasets, by = c("y" = "id"), suffix = c("_x", "_y")) %>%
   arrange(desc(similarity), desc(records_x + records_y)) %>%
